@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Validate and test against a mock API
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install pyyaml
+
+      - name: action.yml is valid, and every declared output is produced
+        run: |
+          python3 - <<'PY'
+          import re, sys, yaml
+          d = yaml.safe_load(open("action.yml"))
+
+          for key in ("name", "description", "runs", "branding"):
+              assert key in d, f"action.yml is missing '{key}'"
+          assert d["runs"]["using"] == "composite"
+
+          steps = d["runs"]["steps"]
+          missing_shell = [s.get("name") for s in steps if "run" in s and "shell" not in s]
+          assert not missing_shell, f"steps missing 'shell': {missing_shell}"
+
+          scripts = " ".join(s.get("run", "") for s in steps)
+          written = set(re.findall(r'^\s*echo "?([a-z-]+)=', scripts, re.M))
+          declared = set(d["outputs"])
+          missing = declared - written
+          assert not missing, f"declared outputs never written: {sorted(missing)}"
+
+          print(f"OK — {len(steps)} steps, {len(d['inputs'])} inputs, {len(declared)} outputs")
+          PY
+
+      - name: Every step's bash parses
+        run: |
+          python3 - <<'PY'
+          import re, subprocess, sys, tempfile, yaml
+          failed = False
+          for step in yaml.safe_load(open("action.yml"))["runs"]["steps"]:
+              script = step.get("run")
+              if not script:
+                  continue
+              cleaned = re.sub(r"\$\{\{.*?\}\}", "X", script)
+              with tempfile.NamedTemporaryFile("w", suffix=".sh") as fh:
+                  fh.write(cleaned); fh.flush()
+                  result = subprocess.run(["bash", "-n", fh.name], capture_output=True, text=True)
+              if result.returncode:
+                  failed = True
+                  print(f"FAIL {step['name']}: {result.stderr}")
+              else:
+                  print(f"ok   {step['name']}")
+          sys.exit(1 if failed else 0)
+          PY
+
+      - name: End-to-end against the mock API
+        run: ./script/test-local.sh
+
+  smoke:
+    name: Run the action itself against the mock API
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start the mock API
+        run: |
+          SCENARIO=pass PORT=8787 python3 script/mock_api.py &
+          for _ in $(seq 1 50); do
+            curl -s -o /dev/null http://127.0.0.1:8787/v1/scan/x/status && break
+            sleep 0.1
+          done
+
+      # Uses the action from this checkout, so a broken action.yml fails CI here
+      # rather than after publishing.
+      - uses: ./
+        id: scan
+        with:
+          api-key: mock-key
+          url: https://example.com
+          min-score: 80
+          comment-on-pr: 'false'
+          api-base: http://127.0.0.1:8787
+
+      - name: Outputs are populated
+        run: |
+          test "${{ steps.scan.outputs.score }}" = "91" || { echo "unexpected score"; exit 1; }
+          test "${{ steps.scan.outputs.passed }}" = "true" || { echo "unexpected passed"; exit 1; }
+          echo "score=${{ steps.scan.outputs.score }} pages=${{ steps.scan.outputs.pages }}"

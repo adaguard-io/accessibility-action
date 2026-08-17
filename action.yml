@@ -1,0 +1,452 @@
+name: 'ADAGuard Accessibility Scan'
+description: 'Scan a URL for WCAG 2.2, ADA, Section 508 and EAA violations, and fail the build when the score drops.'
+author: 'ADAGuard'
+
+branding:
+  icon: 'eye'
+  color: 'blue'
+
+inputs:
+  api-key:
+    description: 'ADAGuard API key. Store it as a repository secret. Requires a Professional plan or above.'
+    required: true
+  url:
+    description: 'URL to scan. Must be publicly reachable — private and internal addresses are rejected.'
+    required: true
+  min-score:
+    description: 'Fail the build when the score falls below this (0-100).'
+    required: false
+    default: '80'
+  scan-mode:
+    description: 'single (the given URL only), crawl (follow internal links), sitemap (read sitemap.xml, then crawl), or layout (crawl, then skip structurally duplicate pages).'
+    required: false
+    default: 'single'
+  max-pages:
+    description: 'Maximum pages to scan. Ignored when scan-mode is "single". Your plan caps this.'
+    required: false
+    default: '1'
+  include-subdomains:
+    description: 'Crawl subdomains of the target host. Set false to stay on the exact hostname. Crawl modes only.'
+    required: false
+    default: 'true'
+  auth-target:
+    description: 'Scan pages behind a login. Pass a target_key from Settings → Authenticated Targets, or "latest" for your most recent session. Requires a Professional plan or above.'
+    required: false
+    default: ''
+  fail-on-scan-error:
+    description: 'Fail the build when the scanner itself errors. Off by default, because that is an infrastructure problem rather than an accessibility regression.'
+    required: false
+    default: 'false'
+  comment-on-pr:
+    description: 'Post results as a pull request comment, updated in place on each push. Needs pull-requests:write.'
+    required: false
+    default: 'true'
+  max-wait-minutes:
+    description: 'Give up waiting after this many minutes, so a stuck scan cannot burn your runner budget.'
+    required: false
+    default: '30'
+  idempotency-key:
+    description: 'Dedupe key. If a scan was already created with this key in the last 24h, its result is reused instead of spending another scan from your quota. Defaults to this run + attempt, so re-running a job after a network flake does not cost a second scan. Set to a unique value (e.g. the commit SHA) to force a fresh scan, or leave blank to disable.'
+    required: false
+    default: ''
+  api-base:
+    description: 'API base URL. Change only when testing against a non-production instance.'
+    required: false
+    default: 'https://api.adaguard.io'
+
+outputs:
+  score:
+    description: 'Accessibility score out of 100. Empty when the scan errored.'
+    value: ${{ steps.poll.outputs.score }}
+  passed:
+    description: 'Whether the scan met min-score. Also false when an authenticated scan fell back to public pages.'
+    value: ${{ steps.poll.outputs.passed }}
+  critical:
+    description: 'Count of critical issues.'
+    value: ${{ steps.poll.outputs.critical }}
+  warning:
+    description: 'Count of warnings.'
+    value: ${{ steps.poll.outputs.warning }}
+  info:
+    description: 'Count of informational issues.'
+    value: ${{ steps.poll.outputs.info }}
+  pages:
+    description: 'Pages actually scanned.'
+    value: ${{ steps.poll.outputs.pages }}
+  scan-id:
+    description: 'Scan ID, for fetching the report from the API later.'
+    value: ${{ steps.submit.outputs.scan-id }}
+  scan-status:
+    description: 'completed or failed.'
+    value: ${{ steps.poll.outputs.scan-status }}
+  auth-status:
+    description: 'not_requested, authenticated, expired_fallback, or public_only.'
+    value: ${{ steps.poll.outputs.auth-status }}
+  dashboard-url:
+    description: 'Human-readable report. Requires signing in to the account that owns the API key.'
+    value: ${{ steps.poll.outputs.dashboard-url }}
+  report-url:
+    description: 'JSON report endpoint, for fetching full results with your API key.'
+    value: ${{ steps.poll.outputs.report-url }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Submit scan
+      id: submit
+      shell: bash
+      env:
+        API_KEY: ${{ inputs.api-key }}
+        API_BASE: ${{ inputs.api-base }}
+        SCAN_URL: ${{ inputs.url }}
+        MIN_SCORE: ${{ inputs.min-score }}
+        SCAN_MODE: ${{ inputs.scan-mode }}
+        MAX_PAGES: ${{ inputs.max-pages }}
+        INCLUDE_SUBDOMAINS: ${{ inputs.include-subdomains }}
+        AUTH_TARGET: ${{ inputs.auth-target }}
+        IDEMPOTENCY_KEY: ${{ inputs.idempotency-key }}
+      run: |
+        set -euo pipefail
+
+        # ── Validate before spending an API call ────────────────────────────
+        [ -n "$API_KEY" ] || { echo "::error::api-key is empty."; exit 1; }
+        [ -n "$SCAN_URL" ] || { echo "::error::url is empty."; exit 1; }
+
+        case "$SCAN_MODE" in
+          single|crawl|sitemap|layout) ;;
+          *) echo "::error::scan-mode must be single, crawl, sitemap or layout (got '$SCAN_MODE')."; exit 1 ;;
+        esac
+
+        case "$INCLUDE_SUBDOMAINS" in
+          true|false) ;;
+          *) echo "::error::include-subdomains must be true or false (got '$INCLUDE_SUBDOMAINS')."; exit 1 ;;
+        esac
+
+        if ! [[ "$MIN_SCORE" =~ ^[0-9]+$ ]] || [ "$MIN_SCORE" -gt 100 ]; then
+          echo "::error::min-score must be a whole number from 0 to 100 (got '$MIN_SCORE')."
+          exit 1
+        fi
+
+        if ! [[ "$MAX_PAGES" =~ ^[0-9]+$ ]] || [ "$MAX_PAGES" -lt 1 ] || [ "$MAX_PAGES" -gt 5000 ]; then
+          echo "::error::max-pages must be a whole number from 1 to 5000 (got '$MAX_PAGES')."
+          exit 1
+        fi
+
+        # A crawl mode left at the default of 1 page silently behaves like single,
+        # which looks like the crawl setting was ignored. Say so rather than let it confuse.
+        if [ "$SCAN_MODE" != "single" ] && [ "$MAX_PAGES" = "1" ]; then
+          echo "::warning::scan-mode is '$SCAN_MODE' but max-pages is 1, so only one page will be scanned. Raise max-pages to crawl further."
+        fi
+
+        # Build the body. Numbers and booleans go in via --argjson so they stay
+        # real JSON types. Crawl-only fields are omitted in single mode, and
+        # min_score is always sent so the API computes `passed` for the gate.
+        BODY=$(jq -n \
+          --arg url "$SCAN_URL" \
+          --arg scan_mode "$SCAN_MODE" \
+          --arg auth_target "$AUTH_TARGET" \
+          --argjson min_score "$MIN_SCORE" \
+          --argjson max_pages "$MAX_PAGES" \
+          --argjson include_subdomains "$INCLUDE_SUBDOMAINS" \
+          '{url: $url, scan_mode: $scan_mode, min_score: $min_score}
+           + (if $scan_mode == "single" then {}
+              else {max_pages: $max_pages, include_subdomains: $include_subdomains} end)
+           + (if $auth_target != "" then {auth_target: $auth_target} else {} end)')
+
+        if [ -n "$AUTH_TARGET" ]; then
+          echo "Scanning $SCAN_URL as authenticated target '$AUTH_TARGET' (mode=$SCAN_MODE min_score=$MIN_SCORE)"
+        else
+          echo "Scanning $SCAN_URL (mode=$SCAN_MODE min_score=$MIN_SCORE)"
+        fi
+
+        # Idempotency: reuse a scan already created with the same key in the last
+        # 24h rather than spending a fresh one from the monthly quota. Defaults to
+        # this run + attempt, so a job re-run after a network flake does not cost
+        # a second scan. An empty value (key explicitly blanked, and no run id in
+        # the environment) disables it.
+        if [ -z "$IDEMPOTENCY_KEY" ] && [ -n "${GITHUB_RUN_ID:-}" ]; then
+          IDEMPOTENCY_KEY="gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-1}"
+        fi
+
+        IDEM_HEADER=()
+        if [ -n "$IDEMPOTENCY_KEY" ]; then
+          IDEM_HEADER=(-H "Idempotency-Key: $IDEMPOTENCY_KEY")
+          echo "Idempotency-Key: $IDEMPOTENCY_KEY"
+        fi
+
+        # -D dumps response headers: a 429 carries X-RateLimit-Type (quota vs
+        # rate_limit) and Retry-After, which turn one vague "429" into two very
+        # different, actionable messages below.
+        HTTP=$(curl -sS -o /tmp/adaguard_submit.json -D /tmp/adaguard_submit_headers.txt -w '%{http_code}' \
+          -X POST "$API_BASE/v1/scan" \
+          -H "X-API-Key: $API_KEY" \
+          -H 'Content-Type: application/json' \
+          "${IDEM_HEADER[@]}" \
+          -d "$BODY") || HTTP='000'
+
+        RESPONSE=$(cat /tmp/adaguard_submit.json 2>/dev/null || echo '')
+
+        # A replay returns the original scan, possibly already completed — say so,
+        # since "Queued" would misdescribe a scan that finished on the first run.
+        if [ "$(echo "$RESPONSE" | jq -r '.idempotent_replay // false' 2>/dev/null)" = 'true' ]; then
+          echo "Reused an existing scan for this key (no quota spent)."
+        fi
+        DETAIL=$(echo "$RESPONSE" | jq -r '
+          if (.detail | type) == "object" then (.detail.error // .detail.message // "")
+          elif (.detail | type) == "string" then .detail
+          else "" end' 2>/dev/null || echo '')
+
+        if [ "$HTTP" -lt 200 ] || [ "$HTTP" -ge 300 ]; then
+          case "$HTTP" in
+            400|422) echo "::error::The API rejected the request (HTTP $HTTP). ${DETAIL:-$RESPONSE}" ;;
+            401)     echo "::error::API key is missing or invalid (HTTP 401). Check the api-key secret." ;;
+            402)     echo "::error::Your plan does not allow this (HTTP 402). ${DETAIL:-Authenticated scanning and API access require Professional or above.}" ;;
+            403)     echo "::error::API key lacks the scans:write scope (HTTP 403)." ;;
+            404)     echo "::error::Authenticated target not found (HTTP 404). ${DETAIL:-Check auth-target, or use 'latest'.}" ;;
+            429)
+              # Two different problems arrive as 429. The API tags which via
+              # X-RateLimit-Type. Both fail the build — the action can't scan, so
+              # passing would hide lost coverage — but they need different fixes,
+              # so they get different messages rather than one vague "429".
+              RL_TYPE=$(grep -i '^x-ratelimit-type:' /tmp/adaguard_submit_headers.txt 2>/dev/null | tail -1 | tr -d '\r' | awk '{print $2}')
+              if [ "$RL_TYPE" = 'quota' ]; then
+                USED=$(echo "$RESPONSE" | jq -r '.detail.scans_used // empty' 2>/dev/null)
+                LIMIT=$(echo "$RESPONSE" | jq -r '.detail.scans_limit // empty' 2>/dev/null)
+                echo "::error::Monthly scan quota reached${USED:+ ($USED/$LIMIT used)}. This will not clear by retrying — upgrade your plan, or wait for next month's reset. See app.adaguard.io/billing."
+              else
+                # Transient hourly throttle. Retry-After (seconds) says when it clears.
+                RETRY=$(grep -i '^retry-after:' /tmp/adaguard_submit_headers.txt 2>/dev/null | tail -1 | tr -d '\r' | awk '{print $2}')
+                echo "::error::Hit the hourly API rate limit (HTTP 429). This is transient${RETRY:+ — retry in ~${RETRY}s}. Your monthly quota is untouched; just re-run the job shortly."
+              fi
+              ;;
+            000)     echo "::error::Could not reach $API_BASE from the runner." ;;
+            *)       echo "::error::Scan submission failed (HTTP $HTTP). ${DETAIL:-$RESPONSE}" ;;
+          esac
+          exit 1
+        fi
+
+        SCAN_ID=$(echo "$RESPONSE" | jq -r '.scan_id // empty')
+        [ -n "$SCAN_ID" ] || { echo "::error::No scan_id in the API response: $RESPONSE"; exit 1; }
+
+        echo "scan-id=$SCAN_ID" >> "$GITHUB_OUTPUT"
+        echo "Queued: $SCAN_ID"
+
+    - name: Wait for results
+      id: poll
+      shell: bash
+      env:
+        API_KEY: ${{ inputs.api-key }}
+        API_BASE: ${{ inputs.api-base }}
+        SCAN_ID: ${{ steps.submit.outputs.scan-id }}
+        MAX_WAIT_MINUTES: ${{ inputs.max-wait-minutes }}
+      run: |
+        set -euo pipefail
+
+        POLL_INTERVAL=10
+        # Two separate ceilings. A scan stuck in the queue is a different failure
+        # from a large crawl legitimately taking a while, so they get different
+        # limits and different messages.
+        MAX_QUEUE_SECS=600
+        MAX_TOTAL_SECS=$(( MAX_WAIT_MINUTES * 60 ))
+        START_TS=$(date +%s)
+        STARTED=false
+
+        while true; do
+          sleep "$POLL_INTERVAL"
+          ELAPSED=$(( $(date +%s) - START_TS ))
+
+          # Deliberately no -f: a transient 5xx or 429 must not kill the job
+          # under `set -e`. Capture the code, tolerate it, retry.
+          HTTP=$(curl -sS -o /tmp/adaguard_status.json -w '%{http_code}' \
+            "$API_BASE/v1/scan/$SCAN_ID/status" \
+            -H "X-API-Key: $API_KEY") || HTTP='000'
+          R=$(cat /tmp/adaguard_status.json 2>/dev/null || echo '')
+
+          if [ "$HTTP" -lt 200 ] || [ "$HTTP" -ge 300 ] || [ -z "$R" ]; then
+            echo "[${ELAPSED}s] status check returned HTTP $HTTP — retrying"
+            if [ "$ELAPSED" -gt "$MAX_TOTAL_SECS" ]; then
+              echo "::error::Gave up after ${MAX_WAIT_MINUTES} minutes; the status endpoint kept failing."
+              exit 1
+            fi
+            continue
+          fi
+
+          STATUS=$(echo "$R" | jq -r '.status // "unknown"')
+          AUTH_STATUS=$(echo "$R" | jq -r '.auth_status // "not_requested"')
+          PAGES=$(echo "$R" | jq -r '.pages_scanned // 0')
+
+          echo "[${ELAPSED}s] status=$STATUS pages=$PAGES auth=$AUTH_STATUS"
+
+          if [ "$STATUS" = 'queued' ] && [ "$ELAPSED" -gt "$MAX_QUEUE_SECS" ]; then
+            echo "::error::Scan never left the queue after $(( MAX_QUEUE_SECS / 60 )) minutes. Re-run the job."
+            exit 1
+          fi
+
+          if [ "$STATUS" != 'queued' ] && [ "$STARTED" = 'false' ]; then
+            STARTED=true
+            echo "Started after ${ELAPSED}s"
+          fi
+
+          if [ "$ELAPSED" -gt "$MAX_TOTAL_SECS" ]; then
+            echo "::error::Scan did not finish within ${MAX_WAIT_MINUTES} minutes. Raise max-wait-minutes, or lower max-pages."
+            exit 1
+          fi
+
+          if [ "$STATUS" = 'completed' ] || [ "$STATUS" = 'failed' ]; then
+            {
+              echo "score=$(echo "$R" | jq -r '.score // empty')"
+              echo "passed=$(echo "$R" | jq -r '.passed // false')"
+              echo "critical=$(echo "$R" | jq -r '.issues_critical // 0')"
+              echo "warning=$(echo "$R" | jq -r '.issues_warning // 0')"
+              echo "info=$(echo "$R" | jq -r '.issues_info // 0')"
+              echo "pages=$PAGES"
+              echo "scan-status=$STATUS"
+              echo "auth-status=$AUTH_STATUS"
+              echo "error=$(echo "$R" | jq -r '.error // empty')"
+              echo "dashboard-url=https://app.adaguard.io/dashboard/$SCAN_ID"
+              echo "report-url=$API_BASE/v1/scan/$SCAN_ID/report?format=json"
+            } >> "$GITHUB_OUTPUT"
+            break
+          fi
+        done
+
+    - name: Report
+      id: report
+      shell: bash
+      env:
+        SCAN_URL: ${{ inputs.url }}
+        MIN_SCORE: ${{ inputs.min-score }}
+        SCORE: ${{ steps.poll.outputs.score }}
+        PASSED: ${{ steps.poll.outputs.passed }}
+        CRITICAL: ${{ steps.poll.outputs.critical }}
+        WARNING: ${{ steps.poll.outputs.warning }}
+        INFO: ${{ steps.poll.outputs.info }}
+        PAGES: ${{ steps.poll.outputs.pages }}
+        SCAN_STATUS: ${{ steps.poll.outputs.scan-status }}
+        AUTH_STATUS: ${{ steps.poll.outputs.auth-status }}
+        SCAN_ERROR: ${{ steps.poll.outputs.error }}
+        DASHBOARD_URL: ${{ steps.poll.outputs.dashboard-url }}
+      run: |
+        set -euo pipefail
+
+        # One headline, reused by the summary and the PR comment, so the two can
+        # never disagree about why the build passed or failed.
+        if [ "$SCAN_STATUS" = 'failed' ]; then
+          HEADLINE="The scanner errored before producing a score.${SCAN_ERROR:+ $SCAN_ERROR}"
+        elif [ "$AUTH_STATUS" = 'expired_fallback' ]; then
+          # The API returns passed=false here regardless of score: the login
+          # session had expired, so only public pages were reached and the
+          # intended scan never happened. Blaming the score would mislead.
+          HEADLINE="The saved login session expired, so only public pages were scanned. Recapture it at Settings → Authenticated Targets."
+        elif [ "$PASSED" = 'true' ]; then
+          HEADLINE="Score **${SCORE}/100** — passed (minimum ${MIN_SCORE})."
+        else
+          HEADLINE="Score **${SCORE}/100** — below the minimum of ${MIN_SCORE}."
+        fi
+
+        echo "headline=$HEADLINE" >> "$GITHUB_OUTPUT"
+
+        {
+          echo "## Accessibility scan"
+          echo ""
+          echo "\`$SCAN_URL\`"
+          echo ""
+          echo "$HEADLINE"
+          if [ "$SCAN_STATUS" != 'failed' ]; then
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Critical | $CRITICAL |"
+            echo "| Warnings | $WARNING |"
+            echo "| Info | $INFO |"
+            echo "| Pages scanned | $PAGES |"
+          fi
+          echo ""
+          echo "[Open the full report]($DASHBOARD_URL)"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Comment on pull request
+      if: ${{ inputs.comment-on-pr == 'true' && github.event_name == 'pull_request' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        SCAN_URL: ${{ inputs.url }}
+        HEADLINE: ${{ steps.report.outputs.headline }}
+        CRITICAL: ${{ steps.poll.outputs.critical }}
+        WARNING: ${{ steps.poll.outputs.warning }}
+        PAGES: ${{ steps.poll.outputs.pages }}
+        SCAN_STATUS: ${{ steps.poll.outputs.scan-status }}
+        DASHBOARD_URL: ${{ steps.poll.outputs.dashboard-url }}
+      run: |
+        set -uo pipefail
+
+        MARKER='<!-- adaguard-accessibility -->'
+
+        if [ "$SCAN_STATUS" = 'failed' ]; then
+          FACTS=''
+        else
+          FACTS="$CRITICAL critical · $WARNING warnings · $PAGES page(s) scanned"
+        fi
+
+        BODY=$(printf '%s### Accessibility\n\n%s\n\n`%s`\n\n%s\n\n[Full report](%s)\n' \
+          "$MARKER" "$HEADLINE" "$SCAN_URL" "$FACTS" "$DASHBOARD_URL")
+
+        # Update our own comment rather than stacking a new one on every push.
+        EXISTING=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+          --jq "[.[] | select(.body | startswith(\"$MARKER\"))][0].id" 2>/dev/null || echo '')
+
+        if [ -n "$EXISTING" ] && [ "$EXISTING" != 'null' ]; then
+          gh api -X PATCH "repos/$REPO/issues/comments/$EXISTING" -f body="$BODY" >/dev/null \
+            && echo 'Updated the existing PR comment.' \
+            || echo '::warning::Could not update the PR comment. Grant the job pull-requests:write.'
+        else
+          gh api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$BODY" >/dev/null \
+            && echo 'Posted a PR comment.' \
+            || echo '::warning::Could not post a PR comment. Grant the job pull-requests:write.'
+        fi
+
+    - name: Apply gate
+      shell: bash
+      env:
+        FAIL_ON_SCAN_ERROR: ${{ inputs.fail-on-scan-error }}
+        PASSED: ${{ steps.poll.outputs.passed }}
+        SCORE: ${{ steps.poll.outputs.score }}
+        MIN_SCORE: ${{ inputs.min-score }}
+        SCAN_STATUS: ${{ steps.poll.outputs.scan-status }}
+        AUTH_STATUS: ${{ steps.poll.outputs.auth-status }}
+        SCAN_ERROR: ${{ steps.poll.outputs.error }}
+      run: |
+        set -euo pipefail
+
+        # A scanner error is an infrastructure problem, not an accessibility
+        # regression, so by default it warns instead of failing the build. A real
+        # regression arrives as completed + passed=false and always fails below.
+        if [ "$SCAN_STATUS" = 'failed' ]; then
+          if [ "$FAIL_ON_SCAN_ERROR" = 'true' ]; then
+            echo "::error::Scan errored and fail-on-scan-error is on.${SCAN_ERROR:+ $SCAN_ERROR}"
+            exit 1
+          fi
+          echo "::warning::Scan errored before producing a score — usually transient. Re-run to retry.${SCAN_ERROR:+ $SCAN_ERROR}"
+          exit 0
+        fi
+
+        # The API fails closed on auth degradation: passed is false whatever the
+        # score, because only public pages were reached. Report that reason
+        # rather than the score, which was never the problem.
+        if [ "$AUTH_STATUS" = 'expired_fallback' ]; then
+          echo "::error::The saved login session expired, so only public pages were scanned. Recapture it at Settings → Authenticated Targets, then re-run."
+          exit 1
+        fi
+
+        if [ "$AUTH_STATUS" = 'public_only' ]; then
+          echo "::notice::No login was needed — the target is publicly reachable."
+        fi
+
+        if [ "$PASSED" != 'true' ]; then
+          echo "::error::Accessibility score ${SCORE}/100 is below the minimum of ${MIN_SCORE}."
+          exit 1
+        fi
+
+        echo "Accessibility check passed — ${SCORE}/100."
