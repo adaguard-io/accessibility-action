@@ -149,10 +149,22 @@ A scanner error is not an accessibility regression, so the two are handled diffe
 Roughly 10–30 seconds per page. A `single` scan finishes in well under a minute; a 50-page crawl
 takes several. Raise `max-wait-minutes` for large crawls.
 
+## Requirements
+
+Runs on any runner with `bash`, `curl` and `jq`. All three are present on
+GitHub-hosted runners; on self-hosted, install `curl` and `jq` first — the
+action checks for them and stops with a clear message before using your quota.
+
+## Security
+
+The API key is sent only to the API host, as a header. It is never printed or
+written to disk. Store it as a repository secret, never in the workflow file.
+See [SECURITY.md](SECURITY.md).
+
 ## Development
 
 ```bash
-./script/test-local.sh    # runs the action's real steps against a mock API
+bash ./script/test-local.sh    # runs the action's real steps against a mock API
 ```
 
 The harness extracts each step from `action.yml` rather than duplicating it, so the tests cannot

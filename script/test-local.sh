@@ -6,7 +6,10 @@
 # drift from what actually ships. GitHub's `${{ inputs.x }}` expressions are
 # substituted with the env vars the workflow would have provided.
 #
-#   ./script/test-local.sh
+#   bash ./script/test-local.sh
+#
+# Invoked via `bash` in docs and CI so it works even where the executable bit
+# was lost (a web-UI upload or plain file copy drops mode 100755).
 #
 set -uo pipefail
 

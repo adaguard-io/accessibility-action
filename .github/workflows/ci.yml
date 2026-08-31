@@ -65,8 +65,12 @@ jobs:
           sys.exit(1 if failed else 0)
           PY
 
+      # Invoked via `bash` rather than `./script/...` so the job does not depend
+      # on the executable bit surviving however the repo was created. A web-UI
+      # upload or a plain file copy drops mode 100755, which fails with a bare
+      # "Permission denied" (exit 126) that looks nothing like its cause.
       - name: End-to-end against the mock API
-        run: ./script/test-local.sh
+        run: bash ./script/test-local.sh
 
   smoke:
     name: Run the action itself against the mock API

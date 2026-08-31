@@ -109,6 +109,14 @@ runs:
         set -euo pipefail
 
         # ── Validate before spending an API call ────────────────────────────
+        for tool in curl jq; do
+          command -v "$tool" >/dev/null 2>&1 || {
+            echo "::error::'$tool' is not installed on this runner. It is present on"\
+                 "GitHub-hosted runners; on self-hosted, install it first."
+            exit 1
+          }
+        done
+
         [ -n "$API_KEY" ] || { echo "::error::api-key is empty."; exit 1; }
         [ -n "$SCAN_URL" ] || { echo "::error::url is empty."; exit 1; }
 
@@ -138,9 +146,7 @@ runs:
           echo "::warning::scan-mode is '$SCAN_MODE' but max-pages is 1, so only one page will be scanned. Raise max-pages to crawl further."
         fi
 
-        # Build the body. Numbers and booleans go in via --argjson so they stay
-        # real JSON types. Crawl-only fields are omitted in single mode, and
-        # min_score is always sent so the API computes `passed` for the gate.
+        # Crawl-only fields are omitted in single mode.
         BODY=$(jq -n \
           --arg url "$SCAN_URL" \
           --arg scan_mode "$SCAN_MODE" \
@@ -159,11 +165,7 @@ runs:
           echo "Scanning $SCAN_URL (mode=$SCAN_MODE min_score=$MIN_SCORE)"
         fi
 
-        # Idempotency: reuse a scan already created with the same key in the last
-        # 24h rather than spending a fresh one from the monthly quota. Defaults to
-        # this run + attempt, so a job re-run after a network flake does not cost
-        # a second scan. An empty value (key explicitly blanked, and no run id in
-        # the environment) disables it.
+        # Reuse a scan created with the same key in the last 24h. Blank disables.
         if [ -z "$IDEMPOTENCY_KEY" ] && [ -n "${GITHUB_RUN_ID:-}" ]; then
           IDEMPOTENCY_KEY="gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-1}"
         fi
@@ -174,9 +176,7 @@ runs:
           echo "Idempotency-Key: $IDEMPOTENCY_KEY"
         fi
 
-        # -D dumps response headers: a 429 carries X-RateLimit-Type (quota vs
-        # rate_limit) and Retry-After, which turn one vague "429" into two very
-        # different, actionable messages below.
+        # -D keeps the headers: a 429 carries X-RateLimit-Type and Retry-After.
         HTTP=$(curl -sS -o /tmp/adaguard_submit.json -D /tmp/adaguard_submit_headers.txt -w '%{http_code}' \
           -X POST "$API_BASE/v1/scan" \
           -H "X-API-Key: $API_KEY" \
@@ -204,10 +204,7 @@ runs:
             403)     echo "::error::API key lacks the scans:write scope (HTTP 403)." ;;
             404)     echo "::error::Authenticated target not found (HTTP 404). ${DETAIL:-Check auth-target, or use 'latest'.}" ;;
             429)
-              # Two different problems arrive as 429. The API tags which via
-              # X-RateLimit-Type. Both fail the build — the action can't scan, so
-              # passing would hide lost coverage — but they need different fixes,
-              # so they get different messages rather than one vague "429".
+              # Quota exhausted and hourly throttle both arrive as 429.
               RL_TYPE=$(grep -i '^x-ratelimit-type:' /tmp/adaguard_submit_headers.txt 2>/dev/null | tail -1 | tr -d '\r' | awk '{print $2}')
               if [ "$RL_TYPE" = 'quota' ]; then
                 USED=$(echo "$RESPONSE" | jq -r '.detail.scans_used // empty' 2>/dev/null)
@@ -243,9 +240,7 @@ runs:
         set -euo pipefail
 
         POLL_INTERVAL=10
-        # Two separate ceilings. A scan stuck in the queue is a different failure
-        # from a large crawl legitimately taking a while, so they get different
-        # limits and different messages.
+        # Separate ceilings for queueing and for the scan itself.
         MAX_QUEUE_SECS=600
         MAX_TOTAL_SECS=$(( MAX_WAIT_MINUTES * 60 ))
         START_TS=$(date +%s)
@@ -334,9 +329,7 @@ runs:
         if [ "$SCAN_STATUS" = 'failed' ]; then
           HEADLINE="The scanner errored before producing a score.${SCAN_ERROR:+ $SCAN_ERROR}"
         elif [ "$AUTH_STATUS" = 'expired_fallback' ]; then
-          # The API returns passed=false here regardless of score: the login
-          # session had expired, so only public pages were reached and the
-          # intended scan never happened. Blaming the score would mislead.
+          # Session expired: only public pages were reached, so score is not the issue.
           HEADLINE="The saved login session expired, so only public pages were scanned. Recapture it at Settings → Authenticated Targets."
         elif [ "$PASSED" = 'true' ]; then
           HEADLINE="Score **${SCORE}/100** — passed (minimum ${MIN_SCORE})."
@@ -420,9 +413,7 @@ runs:
       run: |
         set -euo pipefail
 
-        # A scanner error is an infrastructure problem, not an accessibility
-        # regression, so by default it warns instead of failing the build. A real
-        # regression arrives as completed + passed=false and always fails below.
+        # A scanner error is infrastructure, not a regression — warn unless asked.
         if [ "$SCAN_STATUS" = 'failed' ]; then
           if [ "$FAIL_ON_SCAN_ERROR" = 'true' ]; then
             echo "::error::Scan errored and fail-on-scan-error is on.${SCAN_ERROR:+ $SCAN_ERROR}"
@@ -432,9 +423,7 @@ runs:
           exit 0
         fi
 
-        # The API fails closed on auth degradation: passed is false whatever the
-        # score, because only public pages were reached. Report that reason
-        # rather than the score, which was never the problem.
+        # Auth degraded: report that, not the score.
         if [ "$AUTH_STATUS" = 'expired_fallback' ]; then
           echo "::error::The saved login session expired, so only public pages were scanned. Recapture it at Settings → Authenticated Targets, then re-run."
           exit 1
