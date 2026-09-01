@@ -11,6 +11,8 @@ Scan a URL for WCAG 2.2, ADA, Section 508 and EAA violations, and fail the build
     url: https://staging.example.com
 ```
 
+[Full documentation →](https://www.adaguard.io/docs/github-action)
+
 ## Gate a pull request
 
 ```yaml
@@ -32,56 +34,41 @@ jobs:
           min-score: 90
 ```
 
-The build fails below `min-score`, and results are posted as a single PR comment that is updated in
-place on each push rather than stacked.
+The build fails below `min-score`. Results post as one PR comment, updated in place on each push.
 
 ## Get an API key
 
 Create a key at [app.adaguard.io](https://app.adaguard.io) → Settings → API Keys and add it as a
 repository secret. **API access requires a Professional plan or above.**
 
-## Scan more than one page
-
-`scan-mode` defaults to `single`, which scans just the URL you pass — fast and predictable, so a
-score change means a real change. To cover more, pick a discovery mode **and raise `max-pages`**:
-
-```yaml
-      - uses: adaguard-io/accessibility-action@v1
-        with:
-          api-key: ${{ secrets.ADAGUARD_API_KEY }}
-          url: https://example.com
-          scan-mode: sitemap
-          max-pages: 50
-```
+## Scan modes
 
 | Mode | What it does |
 |---|---|
-| `single` | Scans only the given URL. |
+| `single` | Scans only the given URL. Default. |
 | `crawl` | Follows internal links up to `max-pages`. |
 | `sitemap` | Reads `sitemap.xml`, then crawls those URLs. |
 | `layout` | Crawls, then skips structurally duplicate pages. |
 
-`max-pages` and `include-subdomains` apply to the crawl modes only. Leaving `max-pages` at its
-default of 1 while choosing a crawl mode logs a warning, since it would quietly behave like `single`.
+Crawl modes also need `max-pages` raised above its default of 1:
+
+```yaml
+          scan-mode: sitemap
+          max-pages: 50
+```
+
+`max-pages` and `include-subdomains` apply to crawl modes only.
 
 ## Scan pages behind a login
 
-Capture the session once in the dashboard (Settings → Authenticated Targets), then reference it:
+Capture the session in the dashboard (Settings → Authenticated Targets), then:
 
 ```yaml
-      - uses: adaguard-io/accessibility-action@v1
-        with:
-          api-key: ${{ secrets.ADAGUARD_API_KEY }}
-          url: https://staging.example.com/dashboard
-          auth-target: latest      # or a target_key like 'production-admin'
+          auth-target: latest      # or a target key like 'production-admin'
 ```
 
-The target key is a stable alias — recapturing the session does not change it, so the value keeps
-working and no secret needs rotating. `latest` uses your most recently captured session.
-
-**If the session has expired, the build fails.** The scan falls back to public pages, which means the
-pages you meant to test were never reached, so passing would be misleading. The error names the
-expired session rather than the score. Authenticated scanning requires a Professional plan or above.
+The target key stays the same when you recapture. An expired session fails the build, and the error
+names the session rather than the score. Requires a Professional plan or above.
 
 ## Inputs
 
@@ -97,19 +84,7 @@ expired session rather than the score. Authenticated scanning requires a Profess
 | `fail-on-scan-error` | `false` | Also fail when the scanner itself errors. |
 | `comment-on-pr` | `true` | Post/update a PR comment. |
 | `max-wait-minutes` | `30` | Stop waiting after this long. |
-| `idempotency-key` | run + attempt | Dedupe key (see below). |
-
-## Re-runs don't cost a second scan
-
-Each scan counts against your monthly quota, so re-running a job after a network flake should not
-spend another one. By default the action sends an idempotency key derived from the run and attempt
-(`gha-<run_id>-<attempt>`); if a scan was already created with that key in the last 24 hours, the API
-returns the original result instead of starting a new scan.
-
-- **Re-running the same attempt** (a transient failure, an infra retry) reuses the scan — no quota spent.
-- **A fresh "Re-run all jobs"** increments the attempt, so you get a new scan, which is usually what you want.
-- Pass your own `idempotency-key` (for example the commit SHA) to change that grouping, or set it to a
-  unique value each time to always force a fresh scan.
+| `idempotency-key` | run + attempt | Dedupe key. |
 
 ## Outputs
 
@@ -122,7 +97,7 @@ returns the original result instead of starting a new scan.
 | `scan-id` | Scan ID, for fetching the report later. |
 | `scan-status` | `completed` or `failed`. |
 | `auth-status` | `not_requested`, `authenticated`, `expired_fallback`, or `public_only`. |
-| `dashboard-url` | Human-readable report. Requires signing in to the account owning the API key, so collaborators without that account cannot open it. |
+| `dashboard-url` | Human-readable report. Requires the account owning the API key. |
 | `report-url` | JSON report endpoint, fetchable with your API key. |
 
 ```yaml
@@ -138,42 +113,33 @@ returns the original result instead of starting a new scan.
 
 ## How failures are treated
 
-A scanner error is not an accessibility regression, so the two are handled differently:
-
 | Situation | Result |
 |---|---|
 | Score below `min-score` | Build fails. |
-| Authenticated session expired | Build fails — the intended pages were never scanned. |
-| Scanner errored (network, timeout) | Warns and passes. Set `fail-on-scan-error: true` to fail instead. |
+| Authenticated session expired | Build fails. |
+| Scanner errored (network, timeout) | Warns and passes. Set `fail-on-scan-error: true` to fail. |
 | Scan stuck in the queue over 10 min | Build fails, asking you to re-run. |
-| Scan still running after `max-wait-minutes` | Build fails, so a stuck scan cannot drain your runner budget. |
+| Scan still running after `max-wait-minutes` | Build fails. |
+
+## Quota
+
+Each scan counts against your monthly quota. Re-running the same attempt reuses the scan; **Re-run
+all jobs** starts a new one. Set `idempotency-key` to change that grouping.
 
 ## Timing
 
-About 10 seconds per page, or 13 with `auth-target`. A `single` scan takes well under a minute;
-50 pages takes 8–11 minutes, 100 pages 15–20. Raise `max-wait-minutes` above its 30-minute default
-for anything past roughly 150 pages.
+About 10 seconds per page, 13 with `auth-target`. 50 pages takes 8–11 minutes, 100 pages 15–20.
+Raise `max-wait-minutes` above its 30-minute default past roughly 150 pages.
 
 ## Requirements
 
-Runs on any runner with `bash`, `curl` and `jq`. All three are present on
-GitHub-hosted runners; on self-hosted, install `curl` and `jq` first — the
-action checks for them and stops with a clear message before using your quota.
+Any runner with `bash`, `curl` and `jq`. All three are present on GitHub-hosted runners; install
+`curl` and `jq` on self-hosted.
 
 ## Security
 
-The API key is sent only to the API host, as a header. It is never printed or
-written to disk. Store it as a repository secret, never in the workflow file.
-See [SECURITY.md](SECURITY.md).
-
-## Development
-
-```bash
-bash ./script/test-local.sh    # runs the action's real steps against a mock API
-```
-
-The harness extracts each step from `action.yml` rather than duplicating it, so the tests cannot
-drift from what ships.
+The API key is sent only to the API host, as a header. It is never printed or written to disk. Store
+it as a repository secret. See [SECURITY.md](SECURITY.md).
 
 ## License
 
