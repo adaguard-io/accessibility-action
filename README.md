@@ -1,5 +1,7 @@
 # ADAGuard Accessibility Scan
 
+[![GitHub Marketplace](https://img.shields.io/badge/Marketplace-ADAGuard%20Accessibility%20Scan-blue?logo=github)](https://github.com/marketplace/actions/adaguard-accessibility-scan)
+
 Scan a URL for WCAG 2.2, ADA, Section 508 and EAA violations, and fail the build when the score drops.
 
 ```yaml
@@ -8,9 +10,6 @@ Scan a URL for WCAG 2.2, ADA, Section 508 and EAA violations, and fail the build
     api-key: ${{ secrets.ADAGUARD_API_KEY }}
     url: https://staging.example.com
 ```
-
-Create a key at [app.adaguard.io](https://app.adaguard.io) → Settings → API Keys and add it as a
-repository secret. **API access requires a Professional plan or above.**
 
 ## Gate a pull request
 
@@ -35,6 +34,11 @@ jobs:
 
 The build fails below `min-score`, and results are posted as a single PR comment that is updated in
 place on each push rather than stacked.
+
+## Get an API key
+
+Create a key at [app.adaguard.io](https://app.adaguard.io) → Settings → API Keys and add it as a
+repository secret. **API access requires a Professional plan or above.**
 
 ## Scan more than one page
 
@@ -146,8 +150,9 @@ A scanner error is not an accessibility regression, so the two are handled diffe
 
 ## Timing
 
-Roughly 10–30 seconds per page. A `single` scan finishes in well under a minute; a 50-page crawl
-takes several. Raise `max-wait-minutes` for large crawls.
+About 10 seconds per page, or 13 with `auth-target`. A `single` scan takes well under a minute;
+50 pages takes 8–11 minutes, 100 pages 15–20. Raise `max-wait-minutes` above its 30-minute default
+for anything past roughly 150 pages.
 
 ## Requirements
 
