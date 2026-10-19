@@ -30,7 +30,7 @@ jobs:
       - uses: adaguard-io/accessibility-action@v1
         with:
           api-key: ${{ secrets.ADAGUARD_API_KEY }}
-          url: ${{ steps.deploy.outputs.preview-url }}
+          url: ${{ steps.deploy.outputs.preview-url }}  # from your deploy step
           min-score: 90
 ```
 
@@ -61,7 +61,7 @@ Crawl modes also need `max-pages` raised above its default of 1:
 
 ## Scan pages behind a login
 
-Capture the session in the dashboard (Settings → Authenticated Targets), then:
+Capture the session in the dashboard (Settings → Logged-in sessions), then:
 
 ```yaml
           auth-target: latest      # or a target key like 'production-admin'
@@ -84,7 +84,8 @@ names the session rather than the score. Requires a Professional plan or above.
 | `fail-on-scan-error` | `false` | Also fail when the scanner itself errors. |
 | `comment-on-pr` | `true` | Post/update a PR comment. |
 | `max-wait-minutes` | `30` | Stop waiting after this long. |
-| `idempotency-key` | run + attempt | Dedupe key. |
+| `idempotency-key` | run + attempt + URL | Dedupe key. |
+| `api-base` | `https://api.adaguard.io` | API host. Change only for testing. |
 
 ## Outputs
 
@@ -117,14 +118,16 @@ names the session rather than the score. Requires a Professional plan or above.
 |---|---|
 | Score below `min-score` | Build fails. |
 | Authenticated session expired | Build fails. |
-| Scanner errored (network, timeout) | Warns and passes. Set `fail-on-scan-error: true` to fail. |
+| Scan finished with status `failed` | Warns and passes. Set `fail-on-scan-error: true` to fail. |
+| Couldn't submit (API unreachable, HTTP error, quota or rate limit) | Build fails. |
 | Scan stuck in the queue over 10 min | Build fails, asking you to re-run. |
 | Scan still running after `max-wait-minutes` | Build fails. |
 
 ## Quota
 
-Each scan counts against your monthly quota. Re-running the same attempt reuses the scan; **Re-run
-all jobs** starts a new one. Set `idempotency-key` to change that grouping.
+Each scan counts against your monthly quota. Retries of the same URL within one run attempt reuse the
+scan; any re-run (all jobs or failed jobs) is a new attempt and spends a new scan. The default key
+includes the URL, so several steps in one run each get their own scan.
 
 ## Timing
 
@@ -139,7 +142,15 @@ Any runner with `bash`, `curl` and `jq`. All three are present on GitHub-hosted 
 ## Security
 
 The API key is sent only to the API host, as a header. It is never printed or written to disk. Store
-it as a repository secret. See [SECURITY.md](SECURITY.md).
+it as a repository secret.
+
+## What the action sends
+
+With each scan request the action sends the URL and options you set, plus four headers so the scan
+is listed under the right repository in your ADAGuard account: `X-ADAGuard-Client: github-action`,
+the action version your workflow uses, the repository name (`GITHUB_REPOSITORY`, e.g. `acme/shop`)
+and the event that ran the workflow (`GITHUB_EVENT_NAME`, e.g. `pull_request`). It sends no code,
+no commit contents and no other environment variables.
 
 ## License
 

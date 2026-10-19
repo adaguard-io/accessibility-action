@@ -30,7 +30,7 @@ inputs:
     required: false
     default: 'true'
   auth-target:
-    description: 'Scan pages behind a login. Pass a target_key from Settings → Authenticated Targets, or "latest" for your most recent session. Requires a Professional plan or above.'
+    description: 'Scan pages behind a login. Pass a target_key from Settings → Logged-in sessions, or "latest" for your most recent session. Requires a Professional plan or above.'
     required: false
     default: ''
   fail-on-scan-error:
@@ -46,7 +46,7 @@ inputs:
     required: false
     default: '30'
   idempotency-key:
-    description: 'Dedupe key. If a scan was already created with this key in the last 24h, its result is reused instead of spending another scan from your quota. Defaults to this run + attempt, so re-running a job after a network flake does not cost a second scan. Set to a unique value (e.g. the commit SHA) to force a fresh scan, or leave blank to disable.'
+    description: 'Dedupe key. If a scan was already created with this key in the last 24h, its result is reused instead of spending another scan from your quota. Defaults to this run + attempt + URL: repeated submissions of the same URL within one attempt reuse the scan, and any re-run starts a new one. Leave blank to disable.'
     required: false
     default: ''
   api-base:
@@ -105,6 +105,8 @@ runs:
         INCLUDE_SUBDOMAINS: ${{ inputs.include-subdomains }}
         AUTH_TARGET: ${{ inputs.auth-target }}
         IDEMPOTENCY_KEY: ${{ inputs.idempotency-key }}
+        # Which version of this action the workflow pinned (v1, a tag or a commit).
+        ACTION_REF: ${{ github.action_ref }}
       run: |
         set -euo pipefail
 
@@ -167,7 +169,10 @@ runs:
 
         # Reuse a scan created with the same key in the last 24h. Blank disables.
         if [ -z "$IDEMPOTENCY_KEY" ] && [ -n "${GITHUB_RUN_ID:-}" ]; then
-          IDEMPOTENCY_KEY="gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-1}"
+          # The URL is part of the key: several steps in one run scanning different URLs must each
+          # get their own scan, not the first step's scan back.
+          URL_HASH=$(printf '%s' "$SCAN_URL" | sha256sum | cut -c1-12)
+          IDEMPOTENCY_KEY="gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-1}-${URL_HASH}"
         fi
 
         IDEM_HEADER=()
@@ -181,6 +186,10 @@ runs:
           -X POST "$API_BASE/v1/scan" \
           -H "X-API-Key: $API_KEY" \
           -H 'Content-Type: application/json' \
+          -H 'X-ADAGuard-Client: github-action' \
+          -H "X-ADAGuard-Client-Version: ${ACTION_REF:-}" \
+          -H "X-GitHub-Repository: ${GITHUB_REPOSITORY:-}" \
+          -H "X-GitHub-Event: ${GITHUB_EVENT_NAME:-}" \
           "${IDEM_HEADER[@]}" \
           -d "$BODY") || HTTP='000'
 
@@ -209,7 +218,7 @@ runs:
               if [ "$RL_TYPE" = 'quota' ]; then
                 USED=$(echo "$RESPONSE" | jq -r '.detail.scans_used // empty' 2>/dev/null)
                 LIMIT=$(echo "$RESPONSE" | jq -r '.detail.scans_limit // empty' 2>/dev/null)
-                echo "::error::Monthly scan quota reached${USED:+ ($USED/$LIMIT used)}. This will not clear by retrying — upgrade your plan, or wait for next month's reset. See app.adaguard.io/billing."
+                echo "::error::Monthly scan quota reached${USED:+ ($USED/$LIMIT used)}. This will not clear by retrying — upgrade your plan, or wait for next month's reset. See app.adaguard.io/settings/billing."
               else
                 # Transient hourly throttle. Retry-After (seconds) says when it clears.
                 RETRY=$(grep -i '^retry-after:' /tmp/adaguard_submit_headers.txt 2>/dev/null | tail -1 | tr -d '\r' | awk '{print $2}')
@@ -298,7 +307,7 @@ runs:
               echo "scan-status=$STATUS"
               echo "auth-status=$AUTH_STATUS"
               echo "error=$(echo "$R" | jq -r '.error // empty')"
-              echo "dashboard-url=https://app.adaguard.io/dashboard/$SCAN_ID"
+              echo "dashboard-url=https://app.adaguard.io/scan/$SCAN_ID"
               echo "report-url=$API_BASE/v1/scan/$SCAN_ID/report?format=json"
             } >> "$GITHUB_OUTPUT"
             break
@@ -330,7 +339,7 @@ runs:
           HEADLINE="The scanner errored before producing a score.${SCAN_ERROR:+ $SCAN_ERROR}"
         elif [ "$AUTH_STATUS" = 'expired_fallback' ]; then
           # Session expired: only public pages were reached, so score is not the issue.
-          HEADLINE="The saved login session expired, so only public pages were scanned. Recapture it at Settings → Authenticated Targets."
+          HEADLINE="The saved login session expired, so only public pages were scanned. Recapture it at Settings → Logged-in sessions."
         elif [ "$PASSED" = 'true' ]; then
           HEADLINE="Score **${SCORE}/100** — passed (minimum ${MIN_SCORE})."
         else
@@ -425,7 +434,7 @@ runs:
 
         # Auth degraded: report that, not the score.
         if [ "$AUTH_STATUS" = 'expired_fallback' ]; then
-          echo "::error::The saved login session expired, so only public pages were scanned. Recapture it at Settings → Authenticated Targets, then re-run."
+          echo "::error::The saved login session expired, so only public pages were scanned. Recapture it at Settings → Logged-in sessions, then re-run."
           exit 1
         fi
 

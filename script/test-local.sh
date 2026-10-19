@@ -141,7 +141,7 @@ run_scenario pass 0 0 \
   "sends scan_mode single|single|jq -r .scan_mode /tmp/adaguard_mock_request.json" \
   "sends min_score as a number|number|jq -r '.min_score|type' /tmp/adaguard_mock_request.json" \
   "omits max_pages in single mode|null|jq -r '.max_pages' /tmp/adaguard_mock_request.json" \
-  "derives idempotency key from run+attempt|gha-99887766-2|jq -r '.\"idempotency-key\"' /tmp/adaguard_mock_headers.json"
+  "derives idempotency key from run+attempt+URL|gha-99887766-2-100680ad546c|jq -r '.\"idempotency-key\"' /tmp/adaguard_mock_headers.json"
 
 # An explicit key must win over the derived default.
 IDEMPOTENCY_KEY_OVERRIDE="my-own-key" run_scenario pass 0 0 \
